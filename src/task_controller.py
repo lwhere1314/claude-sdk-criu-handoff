@@ -62,7 +62,11 @@ async def consume(messages: AsyncIterator[Any], label: str) -> TurnResult:
         async for message in messages:
             if output.first_event_ms is None:
                 output.first_event_ms = round((time.monotonic() - started) * 1000)
-            print(f"{label} {compact_message(message)}", flush=True)
+            # Some Anthropic-compatible gateways emit one SystemMessage per
+            # thinking token.  Those events are useful for liveness but add
+            # megabytes of non-semantic noise to each artifact.
+            if getattr(message, "subtype", None) != "thinking_tokens":
+                print(f"{label} {compact_message(message)}", flush=True)
             if getattr(message, "subtype", None) == "error_max_turns":
                 output.max_turns_reached = True
             data = getattr(message, "data", None)

@@ -11,7 +11,8 @@ native session files and workspace survive inside the restored container.
 
 1. A Claude Agent SDK turn runs to completion and returns a native `session_id`.
 2. The Claude CLI subprocess and its HTTPS connection exit.
-3. Docker/CRIU checkpoints the waiting PID 1 controller and filesystem.
+3. Docker/CRIU checkpoints the waiting PID 1 controller; the same container's
+   writable layer retains the native session files and workspace.
 4. The container is restored from that checkpoint.
 5. A new SDK query uses `ClaudeAgentOptions(resume=session_id)`.
 6. The resumed model recalls a nonce from turn one and uses Bash to write an
@@ -124,9 +125,21 @@ explicitly exposes `Read`, `Write`, `Edit`, `Bash`, `Glob`, and `Grep` and must
 produce the real task artifact. Private tests are copied into the container
 only after phase 2 completes; the external task verifier supplies the reward.
 
+Because the CLI runs with `bypassPermissions`, phase 1 also hard-denies Bash,
+write/edit, subagent, and web tools. This is an experimental cut-point guard,
+not a requirement of CRIU or SDK resume: a model may still propose a denied
+tool call, but it cannot execute it before the checkpoint.
+
 Every run retains a credential-free `run.json`, controller log, verifier log,
 reward, and semantic continuity evidence. The isolated daemon uses a separate
 data root and is removed after the campaign.
+
+Aggregate one or more campaigns without reading raw credential-bearing runtime
+state:
+
+```bash
+python3 scripts/aggregate-results.py artifacts/task-matrix
+```
 
 ### Interpretation boundary
 
@@ -138,3 +151,9 @@ claim that CRIU restores an in-flight remote model generation or its TLS
 connection. Active-generation recovery is a separate, explicitly unsupported
 probe until TCP, pidfd, remote timeout, and idempotent replay constraints are
 handled.
+
+See [offline and online restore boundaries](docs/offline-vs-online-restore.md)
+for the staged active-restore design.
+
+See the [Terminal-Bench 2.1 smoke results](docs/robustness-smoke-results.md)
+for the current multi-task, multi-model evidence and its interpretation limits.

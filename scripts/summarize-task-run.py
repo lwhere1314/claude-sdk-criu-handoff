@@ -65,14 +65,34 @@ def main() -> None:
     after_restore = marker_json(log, "TASK_SESSION_AFTER_RESTORE")
     complete = marker_json(log, "TASK_HANDOFF_COMPLETE")
     epochs = re.findall(r"TASK_CONTROLLER_START .*?epoch=([0-9a-f]+)", combined)
+    resumed_epochs = re.findall(r"TASK_CONTROLLER_RESUMED .*?epoch=([0-9a-f]+)", log)
+    turn2_sessions = re.findall(r"TASK_TURN2 .*?session_id=(\S+)", log)
     entrypoint_starts = combined.count("TASK_CONTROLLER_START ")
     quiescence = before.get("quiescence", {})
     jsonl_before = before.get("jsonl_before", {})
     jsonl_after_restore = after_restore
     jsonl_after_turn2 = complete.get("jsonl_after_turn2", {})
 
-    same_session = bool(complete.get("same_session", False))
-    evidence = bool(complete.get("semantic_evidence", False))
+    session_after = complete.get("session_id_after") or (
+        turn2_sessions[-1] if turn2_sessions else None
+    )
+    same_session = bool(
+        complete.get("same_session", False)
+        or (before.get("session_id") and before.get("session_id") == session_after)
+    )
+    evidence_path = log_path.with_name("evidence.txt")
+    expected_evidence = f"NATIVE_SESSION_RESUMED {before.get('nonce', '')}".strip()
+    evidence = bool(
+        complete.get("semantic_evidence", False)
+        or (
+            evidence_path.exists()
+            and evidence_path.read_text(encoding="utf-8", errors="replace").strip()
+            == expected_evidence
+        )
+    )
+    controller_epoch_after = complete.get("controller_epoch_after") or (
+        resumed_epochs[-1] if resumed_epochs else None
+    )
     task_pass = args.reward == 1.0
     checkpoint_created = args.checkpoint_created == "true"
     restored = args.restored == "true"
@@ -82,7 +102,7 @@ def main() -> None:
             checkpoint_created
             and restored
             and len(epochs) == 1
-            and before.get("controller_epoch") == complete.get("controller_epoch_after")
+            and before.get("controller_epoch") == controller_epoch_after
         )
     )
     status = "pass" if same_session and evidence and task_pass and true_criu else "fail"
@@ -137,7 +157,7 @@ def main() -> None:
             "restored": restored,
             "entrypoint_start_count": entrypoint_starts,
             "controller_epoch_before": before.get("controller_epoch"),
-            "controller_epoch_after": complete.get("controller_epoch_after"),
+            "controller_epoch_after": controller_epoch_after,
             "container_pid_before": 1 if before else None,
             "container_pid_after": 1 if complete else None,
             "host_pid_before": nullable_pid(args.before_pid),
@@ -151,9 +171,9 @@ def main() -> None:
         },
         "session": {
             "resume_requested": True,
-            "resume_accepted": bool(complete),
+            "resume_accepted": bool(session_after),
             "id_before": before.get("session_id"),
-            "id_after": complete.get("session_id_after"),
+            "id_after": session_after,
             "same_id": same_session,
             "jsonl": {
                 "before": jsonl_stats(jsonl_before),

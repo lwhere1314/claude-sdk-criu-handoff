@@ -8,6 +8,7 @@ MODELS="kimi-k2.6"
 MODES="criu_stable"
 REPEATS=1
 RESUME_DELAY_SEC=0
+AGENT_TIMEOUT_OVERRIDE=0
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-"$ROOT_DIR/artifacts/task-matrix"}
 STORAGE_DRIVER=${STORAGE_DRIVER:-overlay2}
 CAMPAIGN_ID=${CAMPAIGN_ID:-"tb21-$(date -u +%Y%m%dT%H%M%SZ)"}
@@ -17,6 +18,16 @@ DOCKERD_PID=""
 ADAPTER_IMAGE=""
 MAIN_IMAGE_CREATED=0
 MAIN_DOCKER_PID_BEFORE=$(systemctl show -p MainPID --value docker 2>/dev/null || echo unknown)
+if [[ -z "${HOST_PYTHON:-}" ]]; then
+  for candidate in /usr/local/bin/python3 "$(command -v python3)"; do
+    if [[ -x "$candidate" ]] \
+      && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' \
+        >/dev/null 2>&1; then
+      HOST_PYTHON=$candidate
+      break
+    fi
+  done
+fi
 HOST_PYTHON=${HOST_PYTHON:-$(command -v python3)}
 OWNER_UID=${SUDO_UID:-$UID}
 OWNER_GID=${SUDO_GID:-$(id -g)}
@@ -30,6 +41,7 @@ Options:
   --modes CSV               criu_stable,uninterrupted,native_resume_cold
   --repeats N               Replicates per cell (default: 1)
   --resume-delay-sec N       Delay after restore before resume signal
+  --agent-timeout-sec N      Override the task's per-phase timeout (0 keeps task value)
   --artifact-root PATH       Output directory
   --campaign-id ID           Stable campaign identifier
 EOF
@@ -42,6 +54,7 @@ while (($#)); do
     --modes) MODES=$2; shift 2 ;;
     --repeats) REPEATS=$2; shift 2 ;;
     --resume-delay-sec) RESUME_DELAY_SEC=$2; shift 2 ;;
+    --agent-timeout-sec) AGENT_TIMEOUT_OVERRIDE=$2; shift 2 ;;
     --artifact-root) ARTIFACT_ROOT=$2; shift 2 ;;
     --campaign-id) CAMPAIGN_ID=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -62,6 +75,7 @@ if (( EUID != 0 )); then
     --preserve-env=ENV_FILE,ARTIFACT_ROOT,CAMPAIGN_ID,RUNTIME_DIR_OVERRIDE,STORAGE_DRIVER,HOST_PYTHON,CODING_PLAN_BASE_URL,CODING_PLAN_API_KEY \
     "$0" --task-dir "$TASK_DIR" --models "$MODELS" --modes "$MODES" \
     --repeats "$REPEATS" --resume-delay-sec "$RESUME_DELAY_SEC" \
+    --agent-timeout-sec "$AGENT_TIMEOUT_OVERRIDE" \
     --artifact-root "$ARTIFACT_ROOT" --campaign-id "$CAMPAIGN_ID"
 fi
 
@@ -93,6 +107,7 @@ AGENT_TIMEOUT=${AGENT_TIMEOUT%.*}
 VERIFIER_TIMEOUT=${VERIFIER_TIMEOUT%.*}
 AGENT_TIMEOUT=${AGENT_TIMEOUT:-1800}
 VERIFIER_TIMEOUT=${VERIFIER_TIMEOUT:-1800}
+((AGENT_TIMEOUT_OVERRIDE > 0)) && AGENT_TIMEOUT=$AGENT_TIMEOUT_OVERRIDE
 TASK_WORKDIR=$(docker image inspect -f '{{.Config.WorkingDir}}' "$BASE_IMAGE" 2>/dev/null || true)
 
 stop_owned_process() {
@@ -127,6 +142,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || {
   echo "Base image $BASE_IMAGE is absent; building from task environment..."
@@ -248,6 +264,53 @@ run_verifier() {
     "$artifact_dir/ctrf.json" 2>/dev/null || true
 }
 
+record_incomplete_run() {
+  local failure_stage=$1
+  docker -H "$ISOLATED_HOST" logs "$container" > "$artifact_dir/container.log" 2>&1 || true
+  docker -H "$ISOLATED_HOST" cp "$container:/tmp/claude-handoff/evidence.txt" \
+    "$artifact_dir/evidence.txt" 2>/dev/null || true
+  printf '125\n' > "$artifact_dir/verifier-exit-code.txt"
+  printf '0\n' > "$artifact_dir/verifier-duration-ms.txt"
+  printf '0\n' > "$artifact_dir/reward.txt"
+  docker -H "$ISOLATED_HOST" inspect -f '{{.State.ExitCode}}' "$container" \
+    > "$artifact_dir/controller-exit-code.txt" 2>/dev/null || printf '125\n' \
+    > "$artifact_dir/controller-exit-code.txt"
+  total_ms=$(((SECONDS - started_total) * 1000))
+
+  "$HOST_PYTHON" "$ROOT_DIR/scripts/summarize-task-run.py" \
+    --log "$artifact_dir/container.log" \
+    --turn1-log "$artifact_dir/turn1-container.log" \
+    --output "$artifact_dir/run.json" --run-id "$run_id" --campaign-id "$CAMPAIGN_ID" \
+    --git-sha "$GIT_SHA" --replicate "$replicate" --task-id "$TASK_ID" \
+    --dataset-sha256 "$DATASET_SHA" --model "$model" --mode "$mode" \
+    --resume-delay-ms "$((RESUME_DELAY_SEC * 1000))" --before-pid "$before_pid" \
+    --after-pid "$after_pid" --checkpoint-created "$checkpoint_created" \
+    --checkpoint-state "$checkpoint_state" --restored "$restored" \
+    --checkpoint-ms "$checkpoint_ms" --restore-ms "$restore_ms" \
+    --verifier-exit 125 --verifier-ms 0 --reward 0 --total-ms "$total_ms" \
+    --docker-version "$DOCKER_VERSION" --runc-version "$RUNC_VERSION" \
+    --criu-version "$CRIU_VERSION" --kernel "$KERNEL_VERSION"
+  "$HOST_PYTHON" - "$artifact_dir/run.json" "$failure_stage" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+data["outcome"].update({
+    "status": "fail",
+    "failure_stage": sys.argv[2],
+    "error_class": "stage_timeout_or_failure",
+    "error_message_sanitized": f"run did not reach the {sys.argv[2]} completion marker",
+})
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  docker -H "$ISOLATED_HOST" rm -f "$container" >/dev/null 2>&1 || true
+  [[ "$mode" == native_resume_cold && -n "${cold_image:-}" ]] \
+    && docker -H "$ISOLATED_HOST" image rm "$cold_image" >/dev/null 2>&1 || true
+  echo "RUN_INCOMPLETE task=$TASK_ID model=$model mode=$mode stage=$failure_stage"
+}
+
 IFS=',' read -r -a MODEL_LIST <<< "$MODELS"
 IFS=',' read -r -a MODE_LIST <<< "$MODES"
 mkdir -p "$ARTIFACT_ROOT/$CAMPAIGN_ID"
@@ -270,22 +333,34 @@ for model in "${MODEL_LIST[@]}"; do
       started_total=$SECONDS
       before_pid=null after_pid=null checkpoint_state=null checkpoint_created=false restored=false
       checkpoint_ms=0 restore_ms=0
+      cold_image=""
 
       docker -H "$ISOLATED_HOST" run -d --name "$container" --network host \
         --security-opt seccomp=unconfined --cpus "$CPU_LIMIT" --memory "${MEMORY_MB}m" \
         --env-file "$env_file" "$ADAPTER_IMAGE" >/dev/null
-      wait_for_log "$container" TASK_HANDOFF_READY "$AGENT_TIMEOUT"
+      if ! wait_for_log "$container" TASK_HANDOFF_READY "$AGENT_TIMEOUT"; then
+        record_incomplete_run phase1
+        continue
+      fi
 
       if [[ "$mode" == criu_stable ]]; then
         before_pid=$(docker -H "$ISOLATED_HOST" inspect -f '{{.State.Pid}}' "$container")
         cp_start=$SECONDS
-        docker -H "$ISOLATED_HOST" checkpoint create "$container" "$checkpoint" >/dev/null
+        if ! docker -H "$ISOLATED_HOST" checkpoint create "$container" "$checkpoint" >/dev/null; then
+          checkpoint_ms=$(((SECONDS - cp_start) * 1000))
+          record_incomplete_run checkpoint
+          continue
+        fi
         checkpoint_ms=$(((SECONDS - cp_start) * 1000))
         checkpoint_created=true
         checkpoint_state=$(docker -H "$ISOLATED_HOST" inspect -f '{{.State.Status}}' "$container")
         [[ "$checkpoint_state" == exited ]]
         restore_start=$SECONDS
-        docker -H "$ISOLATED_HOST" start --checkpoint "$checkpoint" "$container" >/dev/null
+        if ! docker -H "$ISOLATED_HOST" start --checkpoint "$checkpoint" "$container" >/dev/null; then
+          restore_ms=$(((SECONDS - restore_start) * 1000))
+          record_incomplete_run restore
+          continue
+        fi
         restore_ms=$(((SECONDS - restore_start) * 1000))
         restored=true
         after_pid=$(docker -H "$ISOLATED_HOST" inspect -f '{{.State.Pid}}' "$container")
@@ -314,7 +389,10 @@ for model in "${MODEL_LIST[@]}"; do
         checkpoint_state=not_attempted
       fi
 
-      wait_for_log "$container" TASK_HANDOFF_COMPLETE "$AGENT_TIMEOUT"
+      if ! wait_for_log "$container" TASK_HANDOFF_COMPLETE "$AGENT_TIMEOUT"; then
+        record_incomplete_run phase2
+        continue
+      fi
       docker -H "$ISOLATED_HOST" logs "$container" > "$artifact_dir/container.log" 2>&1
       docker -H "$ISOLATED_HOST" cp "$container:/tmp/claude-handoff/evidence.txt" \
         "$artifact_dir/evidence.txt"
