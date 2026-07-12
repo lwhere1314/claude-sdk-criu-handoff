@@ -95,3 +95,46 @@ make check
 The GitHub Actions workflow performs static Python and shell syntax checks. The
 full CRIU test is intentionally host-run because hosted CI runners generally do
 not provide this daemon/checkpoint setup.
+
+## Terminal-Bench 2.1 robustness matrix
+
+`scripts/run-task-matrix.sh` layers the SDK controller onto a real
+Terminal-Bench task image without adding the task's tests to the agent image.
+It supports three treatments:
+
+- `uninterrupted`: two native SDK turns in one controller, without CRIU
+- `native_resume_cold`: export the post-turn filesystem without container
+  environment metadata, start a new PID 1 controller, and resume the session
+- `criu_stable`: checkpoint and restore the waiting PID 1 controller before
+  the second SDK turn
+
+Example:
+
+```bash
+./scripts/run-task-matrix.sh \
+  --task-dir /path/to/terminal-bench-2.1/query-optimize \
+  --models kimi-k2.6,doubao-seed-2.0-code,doubao-seed-2.0-pro \
+  --modes uninterrupted,criu_stable \
+  --repeats 1
+```
+
+Phase 1 is deliberately read-only and exposes only `Read`, `Glob`, and `Grep`.
+This creates a comparable quiescent checkpoint boundary across models. Phase 2
+explicitly exposes `Read`, `Write`, `Edit`, `Bash`, `Glob`, and `Grep` and must
+produce the real task artifact. Private tests are copied into the container
+only after phase 2 completes; the external task verifier supplies the reward.
+
+Every run retains a credential-free `run.json`, controller log, verifier log,
+reward, and semantic continuity evidence. The isolated daemon uses a separate
+data root and is removed after the campaign.
+
+### Interpretation boundary
+
+The CRIU treatment restores the local PID 1 controller's memory and execution
+point. A fresh Claude CLI process then performs the official SDK native resume
+from the session JSONL. The experiment therefore demonstrates compatibility
+between CRIU controller restoration and native session resume; it does not
+claim that CRIU restores an in-flight remote model generation or its TLS
+connection. Active-generation recovery is a separate, explicitly unsupported
+probe until TCP, pidfd, remote timeout, and idempotent replay constraints are
+handled.
