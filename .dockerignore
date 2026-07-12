@@ -1,0 +1,8 @@
+.git
+.github
+.env
+artifacts
+__pycache__
+*.py[cod]
+docs
+README.md
