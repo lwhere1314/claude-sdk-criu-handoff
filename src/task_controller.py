@@ -20,6 +20,8 @@ CONTINUE = MARKER_DIR / "continue"
 EVIDENCE = MARKER_DIR / "evidence.txt"
 MANIFEST = MARKER_DIR / "manifest.json"
 VERIFIER_COMPLETE = MARKER_DIR / "verifier-complete"
+TARGET_MODEL_FILE = MARKER_DIR / "target-model"
+SOURCE_CUTPOINT = MARKER_DIR / "source-cutpoint.json"
 INSTRUCTION = Path(os.environ.get("TASK_INSTRUCTION_PATH", "/opt/task-instruction.md"))
 
 
@@ -29,6 +31,17 @@ class TurnResult:
     observed_model: str | None = None
     first_event_ms: int | None = None
     max_turns_reached: bool = False
+
+
+def file_stats(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"exists": False, "bytes": 0, "sha256": None}
+    payload = path.read_bytes()
+    return {
+        "exists": True,
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def compact_message(message: Any) -> str:
@@ -81,10 +94,13 @@ async def consume(messages: AsyncIterator[Any], label: str) -> TurnResult:
                 output.observed_model = str(candidate_model)
     except Exception as exc:
         if output.session_id and (
-            output.max_turns_reached or "maximum number of turns" in str(exc).lower()
+            output.max_turns_reached
+            or "maximum number of turns" in str(exc).lower()
+            or SOURCE_CUTPOINT.exists()
         ):
+            reason = "source_cutpoint" if SOURCE_CUTPOINT.exists() else "max_turns"
             print(
-                f"{label}_EXPECTED_CUTOFF session_id={output.session_id} reason=max_turns",
+                f"{label}_EXPECTED_CUTOFF session_id={output.session_id} reason={reason}",
                 flush=True,
             )
         else:
@@ -234,9 +250,85 @@ def common_options(
 
 
 async def run_first_turn(model: str, nonce: str) -> TurnResult:
-    from claude_agent_sdk import ClaudeAgentOptions, query
+    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
 
     task = INSTRUCTION.read_text(encoding="utf-8")
+    strategy = os.environ.get("SOURCE_STRATEGY", "plan")
+    if strategy in {"attempt", "write_run_py"}:
+        if strategy == "write_run_py" and (WORKSPACE / "run.py").exists():
+            raise RuntimeError("write_run_py requires run.py to be absent initially")
+        if strategy == "write_run_py":
+            source_action = f"""Begin solving the task in {WORKSPACE}. Inspect the workspace and then write your first concrete implementation to {WORKSPACE / 'run.py'}. Do not stop at a plan. Remember this nonce exactly: {nonce}
+
+The experiment controller will end this source turn immediately after the first successful tool call that leaves a non-empty run.py. Do not read private tests."""
+        else:
+            source_action = f"""Solve the task completely in {WORKSPACE}. Use the available coding tools, run appropriate checks, and leave your best final implementation in the workspace. Do not stop at a plan. Remember this nonce exactly: {nonce}
+
+Finish with the exact marker SOURCE_ATTEMPT_COMPLETE."""
+        prompt = f"""You are the source model in a fixed-checkpoint Terminal-Bench takeover experiment.
+
+Task instruction:
+{task}
+
+{source_action}
+"""
+
+        async def post_tool_use(input_data, tool_use_id, hook_context):
+            del hook_context
+            run_py = WORKSPACE / "run.py"
+            stats = file_stats(run_py)
+            if strategy != "write_run_py" or not stats["exists"] or stats["bytes"] <= 0:
+                return {"continue_": True}
+            data = input_data if isinstance(input_data, dict) else {}
+            cutpoint = {
+                "cutpoint": "first_nonempty_run_py_after_tool",
+                "tool_name": str(data.get("tool_name") or ""),
+                "tool_use_id": str(tool_use_id),
+                "run_py": stats,
+                "captured_at_unix_ms": round(time.time() * 1000),
+            }
+            SOURCE_CUTPOINT.write_text(
+                json.dumps(cutpoint, sort_keys=True), encoding="utf-8"
+            )
+            print("TASK_SOURCE_CUTPOINT " + json.dumps(cutpoint, sort_keys=True), flush=True)
+            return {
+                "continue_": False,
+                "stopReason": "fixed checkpoint reached after first non-empty run.py",
+            }
+
+        async def prompt_stream():
+            # Hooks use the SDK control channel. Keep stream-json stdin alive
+            # until the PostToolUse callback has returned its stop decision.
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": prompt},
+                "parent_tool_use_id": None,
+            }
+
+        hooks = {}
+        if strategy == "write_run_py":
+            hooks = {
+                "PostToolUse": [HookMatcher(matcher=None, hooks=[post_tool_use])]
+            }
+        return await consume(
+            query(
+                prompt=prompt_stream(),
+                options=ClaudeAgentOptions(
+                    model=model,
+                    hooks=hooks,
+                    **common_options(
+                        int(os.environ.get("SOURCE_MAX_TURNS", "20")),
+                        ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+                        max_thinking_tokens=int(
+                            os.environ.get("SOURCE_MAX_THINKING_TOKENS", "8192")
+                        ),
+                    ),
+                ),
+            ),
+            "TASK_TURN1",
+        )
+    if strategy != "plan":
+        raise ValueError(f"Unsupported SOURCE_STRATEGY: {strategy}")
     prompt = f"""You are phase 1 of a two-phase Terminal-Bench run.
 
 Task instruction:
@@ -269,12 +361,12 @@ Finish with a concise handoff summary and the exact marker PHASE1_COMPLETE.
 async def run_second_turn(session_id: str, model: str, nonce: str) -> TurnResult:
     from claude_agent_sdk import ClaudeAgentOptions, query
 
-    prompt = f"""You are phase 2 after a native-session handoff.
+    prompt = f"""You are the target model after a native-session handoff from another model.
 
-First state the exact nonce remembered from phase 1. Immediately use Bash to write exactly this one line to {EVIDENCE}:
-NATIVE_SESSION_RESUMED {nonce}
+First state the exact nonce remembered from the source model's session without using any tool. Then immediately use Bash to write one line to {EVIDENCE} in this format, substituting the nonce you remembered:
+NATIVE_SESSION_RESUMED <remembered nonce>
 
-After recording that continuity evidence, implement the Terminal-Bench task completely in {WORKSPACE}. Use tools, run appropriate checks, and leave the required final files in place. Do not merely explain a solution.
+After recording that continuity evidence, inspect the source model's existing work, repair any mistakes, and complete the Terminal-Bench task in {WORKSPACE}. Use tools, run appropriate checks, and leave the required final files in place. Do not merely explain a solution.
 
 Finish with the exact marker PHASE2_COMPLETE.
 """
@@ -299,7 +391,7 @@ Finish with the exact marker PHASE2_COMPLETE.
 
 async def main() -> None:
     phase = os.environ.get("HANDOFF_PHASE", "both")
-    if phase not in {"both", "first", "resume"}:
+    if phase not in {"both", "first", "resume", "hold"}:
         raise ValueError(f"Unsupported HANDOFF_PHASE: {phase}")
 
     MARKER_DIR.mkdir(parents=True, exist_ok=True)
@@ -315,7 +407,10 @@ async def main() -> None:
     )
 
     if phase in {"both", "first"}:
-        for marker in (READY, CONTINUE, EVIDENCE, MANIFEST, VERIFIER_COMPLETE):
+        for marker in (
+            READY, CONTINUE, EVIDENCE, MANIFEST, VERIFIER_COMPLETE,
+            TARGET_MODEL_FILE, SOURCE_CUTPOINT,
+        ):
             marker.unlink(missing_ok=True)
         turn1_started = time.monotonic()
         first = await run_first_turn(source_model, nonce)
@@ -328,6 +423,12 @@ async def main() -> None:
             "session_id": first.session_id,
             "source_model": source_model,
             "target_model": target_model,
+            "source_strategy": os.environ.get("SOURCE_STRATEGY", "plan"),
+            "source_cutpoint": (
+                json.loads(SOURCE_CUTPOINT.read_text(encoding="utf-8"))
+                if SOURCE_CUTPOINT.exists()
+                else None
+            ),
             "nonce": nonce,
             "controller_epoch": controller_epoch,
             "turn1_ms": turn1_ms,
@@ -355,9 +456,41 @@ async def main() -> None:
         target_model = os.environ.get("TARGET_MODEL", str(manifest["target_model"]))
         nonce = str(manifest["nonce"])
 
-    if phase == "both":
+        if phase == "hold":
+            for marker in (READY, CONTINUE, EVIDENCE, VERIFIER_COMPLETE, TARGET_MODEL_FILE):
+                marker.unlink(missing_ok=True)
+            original_epoch = manifest.get("controller_epoch")
+            quiescence = await wait_for_quiescence()
+            stats = session_stats(str(first.session_id))
+            manifest.update({
+                "controller_epoch": controller_epoch,
+                "rehydrated_from_controller_epoch": original_epoch,
+                "target_model": target_model,
+                "quiescence": quiescence,
+                "jsonl_before": stats,
+            })
+            MANIFEST.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+            READY.write_text(str(first.session_id) + "\n", encoding="utf-8")
+            print("TASK_SESSION_BEFORE " + json.dumps(manifest, sort_keys=True), flush=True)
+            print(
+                f"TASK_HANDOFF_READY session_id={first.session_id} epoch={controller_epoch} "
+                f"rehydrated_from={original_epoch}",
+                flush=True,
+            )
+
+    if phase in {"both", "hold"}:
         while not CONTINUE.exists():
             await asyncio.sleep(0.2)
+
+    if TARGET_MODEL_FILE.exists():
+        selected_target = TARGET_MODEL_FILE.read_text(encoding="utf-8").strip()
+        if selected_target:
+            target_model = selected_target
+
+    # The target must recover the nonce from the native session, not from a
+    # controller manifest or inherited environment variable.
+    MANIFEST.unlink(missing_ok=True)
+    os.environ.pop("HANDOFF_NONCE", None)
 
     stats_after_restore = session_stats(str(first.session_id))
     print(
@@ -367,6 +500,11 @@ async def main() -> None:
         flush=True,
     )
     print("TASK_SESSION_AFTER_RESTORE " + json.dumps(stats_after_restore, sort_keys=True), flush=True)
+    print(
+        "TASK_WORKSPACE_AFTER_RESTORE "
+        + json.dumps({"run_py": file_stats(WORKSPACE / "run.py")}, sort_keys=True),
+        flush=True,
+    )
     turn2_started = time.monotonic()
     second = await run_second_turn(str(first.session_id), target_model, nonce)
     turn2_ms = round((time.monotonic() - turn2_started) * 1000)

@@ -15,10 +15,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     for name in (
         "log", "turn1_log", "output", "run_id", "campaign_id", "git_sha",
-        "task_id", "dataset_sha256", "model", "mode", "checkpoint_state",
+        "task_id", "dataset_sha256", "mode", "checkpoint_state",
         "docker_version", "runc_version", "criu_version", "kernel",
     ):
         parser.add_argument("--" + name.replace("_", "-"), required=True)
+    parser.add_argument("--model")
+    parser.add_argument("--source-model")
+    parser.add_argument("--target-model")
     for name in (
         "replicate", "resume_delay_ms", "checkpoint_ms", "restore_ms",
         "verifier_exit", "verifier_ms", "total_ms",
@@ -55,6 +58,10 @@ def jsonl_stats(value: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    source_model = args.source_model or args.model
+    target_model = args.target_model or args.model or source_model
+    if not source_model or not target_model:
+        raise SystemExit("provide --model or both --source-model/--target-model")
     log_path = Path(args.log)
     turn1_path = Path(args.turn1_log)
     log = log_path.read_text(encoding="utf-8", errors="replace")
@@ -96,12 +103,13 @@ def main() -> None:
     task_pass = args.reward == 1.0
     checkpoint_created = args.checkpoint_created == "true"
     restored = args.restored == "true"
+    criu_mode = args.mode in {"criu_stable", "criu_clone"}
     true_criu = (
-        args.mode != "criu_stable"
+        not criu_mode
         or (
             checkpoint_created
             and restored
-            and len(epochs) == 1
+            and len(set(epochs)) == 1
             and before.get("controller_epoch") == controller_epoch_after
         )
     )
@@ -129,10 +137,10 @@ def main() -> None:
             "dataset_sha256": args.dataset_sha256,
         },
         "route": {
-            "source_model": args.model,
-            "target_model": args.model,
-            "requested_model_turn1": before.get("source_model", args.model),
-            "requested_model_turn2": complete.get("requested_model_turn2", args.model),
+            "source_model": source_model,
+            "target_model": target_model,
+            "requested_model_turn1": before.get("source_model", source_model),
+            "requested_model_turn2": complete.get("requested_model_turn2", target_model),
             "observed_model_turn1": before.get("observed_model_turn1"),
             "observed_model_turn2": complete.get("observed_model_turn2"),
         },
@@ -151,7 +159,7 @@ def main() -> None:
             "host_fingerprint": "aliyun-linux-admin",
         },
         "checkpoint": {
-            "attempted": args.mode == "criu_stable",
+            "attempted": criu_mode,
             "created": checkpoint_created,
             "state_after_create": args.checkpoint_state,
             "restored": restored,

@@ -141,6 +141,57 @@ state:
 python3 scripts/aggregate-results.py artifacts/task-matrix
 ```
 
+## Fixed cross-model takeover
+
+`scripts/run-fixed-takeover.sh` is the task-level experiment for a real coding
+boundary. With `--source-strategy write_run_py`, the source model may inspect
+the task and use normal coding tools. An SDK `PostToolUse` hook stops the turn
+immediately after the first successful tool call that leaves a non-empty
+`run.py`. With `--source-strategy attempt`, the source instead receives a full
+coding attempt, so a naturally failing final workspace and its native session
+can be frozen. The runner then:
+
+1. records the workspace and native-session hashes;
+2. verifies the source workspace without exposing held-out tests beforehand;
+3. checkpoints the quiescent PID 1 controller with CRIU;
+4. restores the exact workspace and SDK session;
+5. resumes that session with the requested target model; and
+6. verifies the target workspace and records whether `run.py` changed.
+
+Example:
+
+```bash
+./scripts/run-fixed-takeover.sh \
+  --task-dir /path/to/terminal-bench-2.1/cancel-async-tasks \
+  --source-model kimi-k2.6 \
+  --target-models kimi-k2.7-code \
+  --source-strategy write_run_py
+```
+
+Use `--source-checkpoint-input` to repeat targets from an already captured
+credential-free source directory containing `run.py`, `native-manifest.json`,
+and `native-session/`. This rehydrates the exact workspace and SDK session in
+a new waiting controller, records the original controller epoch, and creates a
+new CRIU checkpoint. It does not claim to resurrect deleted CRIU page images.
+The rehydrated controller does not call the source model again.
+
+For a controlled multi-target comparison, invoke the runner once per target
+with the same `--source-checkpoint-input`. Each target then receives its own
+CRIU-restored waiting controller while the input workspace and native-session
+hashes remain identical. Docker 26 does not support restoring one checkpoint
+into a differently named container via a custom checkpoint directory; a
+multi-model CSV therefore records later targets as `native_resume_cold` when
+that clone attempt is rejected, rather than mislabeling them as CRIU restores.
+
+Source correctness, agent completion, and final task correctness are separate
+measurements. A first `run.py` may already pass, and an agent may time out after
+producing correct code. The timeout path therefore freezes and independently
+verifies the final workspace instead of assigning a synthetic zero reward.
+
+The read-only Phase 1 restrictions described above apply to
+`run-task-matrix.sh`, not this fixed coding boundary. The fixed takeover runner
+must allow write and execution tools before its explicit hook cutpoint.
+
 ### Interpretation boundary
 
 The CRIU treatment restores the local PID 1 controller's memory and execution
