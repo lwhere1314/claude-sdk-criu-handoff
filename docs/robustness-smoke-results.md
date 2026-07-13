@@ -39,6 +39,46 @@ restored sessions and semantic handoffs succeeded, but no `model.bin` was
 produced before the 1200- and 900-second experiment caps. The task's official
 agent timeout is 3600 seconds.
 
+## Fixed Kimi failure takeover
+
+These campaigns are reported separately from the aggregate smoke counts below.
+They reuse one real Kimi 2.6 `cancel-async-tasks` failure rather than sampling a
+new source trajectory for every target:
+
+- source verifier: 5/6, reward 0; only
+  `test_tasks_cancel_above_max_concurrent` failed;
+- source `run.py` SHA-256:
+  `52cb984a8e37f564dad5f1333429b68c61f7ac855a89ea3c760d3593c68e3461`;
+- source native JSONL: 69 lines, 137296 bytes, SHA-256
+  `4762c69dca6a127c6c4e48077ac5c1c5b780c8f11f6242f39cc1a3fbb3612135`;
+- fixed input-directory SHA-256:
+  `9e27829446850bb7155b1af83e9824a6bdc84090616c7e7ec2f164d647673d6c`.
+
+| Target | Treatment | Native continuity | Workspace hash restored | Target changed `run.py` | Verifier |
+|---|---|---:|---:|---:|---:|
+| doubao-seed-2.0-pro | CRIU stable | pass | pass | no | 5/6, reward 0 |
+| deepseek-v4-pro | CRIU stable | pass | pass | yes | 6/6, reward 1 |
+| deepseek-v4-pro | cold native control | pass | pass | yes | 6/6, reward 1 |
+
+Both CRIU rows restored PID 1 with a changed host PID and an unchanged
+controller epoch. Both also resumed the exact Kimi session ID, recovered the
+nonce from native history, and began from the hashes above. Seed completed the
+handoff but left the failing workspace unchanged. DeepSeek changed `run.py` and
+passed all six tests; its CRIU run took about 14 minutes because it generated a
+hanging diagnostic before recovering without human intervention.
+
+The original Kimi controller's deleted CRIU pages were not available. The
+runner therefore loaded the fixed workspace and native session into a fresh
+waiting controller, recorded the original epoch as provenance, checkpointed
+that waiting controller, and restored it before target resume. This proves
+CRIU restoration of the rehydrated controller plus native cross-model resume;
+it does not claim resurrection of the original Kimi process memory.
+
+Docker 26 rejected cross-container clone restore with `custom checkpointdir is
+not supported`. The controlled CRIU comparison consequently used one runner
+invocation per target, both referencing the same fixed input hash. The cold
+DeepSeek route is retained as a control and is not mislabeled as CRIU.
+
 ## Robustness controls
 
 The Kimi 2.7 control campaign produced:
