@@ -168,6 +168,14 @@ Example:
   --source-strategy write_run_py
 ```
 
+Add `--source-only` to sample and score independent source cutpoints without
+running a target continuation. Each campaign still creates and hashes a real
+CRIU checkpoint, runs the held-out verifier against the frozen workspace, and
+then removes the sensitive checkpoint pages and isolated daemon data root.
+This mode is useful for estimating how often a source model's first
+implementation is already correct before selecting fixed failures for target
+takeover experiments.
+
 Use `--source-checkpoint-input` to repeat targets from an already captured
 credential-free source directory containing `run.py`, `native-manifest.json`,
 and `native-session/`. This rehydrates the exact workspace and SDK session in
@@ -191,6 +199,14 @@ verifies the final workspace instead of assigning a synthetic zero reward.
 The read-only Phase 1 restrictions described above apply to
 `run-task-matrix.sh`, not this fixed coding boundary. The fixed takeover runner
 must allow write and execution tools before its explicit hook cutpoint.
+
+The retained source directory is an auditable, credential-free rehydration
+bundle, not a portable process snapshot. It stores the workspace, native SDK
+session, manifests, verifier output, image identity, and a content hash of the
+CRIU checkpoint. Raw CRIU memory pages and the isolated Docker data root are
+deleted because process memory may contain API credentials. Exact CRIU restore
+is available only while a live campaign retains those pages; later experiments
+can rehydrate the same workspace and native session in a new controller.
 
 ### Interpretation boundary
 

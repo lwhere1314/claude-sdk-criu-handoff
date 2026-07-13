@@ -8,6 +8,7 @@ SOURCE_MODEL="kimi-k2.6"
 TARGET_MODELS="kimi-k2.7-code"
 SOURCE_STRATEGY="write_run_py"
 SOURCE_CHECKPOINT_INPUT=""
+SOURCE_ONLY=0
 AGENT_TIMEOUT_OVERRIDE=0
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-"$ROOT_DIR/artifacts/fixed-takeover"}
 CAMPAIGN_ID=${CAMPAIGN_ID:-"takeover-$(date -u +%Y%m%dT%H%M%SZ)"}
@@ -45,6 +46,7 @@ Options:
   --source-checkpoint-input PATH
                              Rehydrate a fixed workspace/native session instead
                              of sampling the source model again
+  --source-only              Stop after checkpointing and verifying the source
   --agent-timeout-sec N      Override task timeout for each model phase
   --artifact-root PATH       Credential-free result root
   --campaign-id ID           Stable campaign identifier
@@ -58,6 +60,7 @@ while (($#)); do
     --target-models) TARGET_MODELS=$2; shift 2 ;;
     --source-strategy) SOURCE_STRATEGY=$2; shift 2 ;;
     --source-checkpoint-input) SOURCE_CHECKPOINT_INPUT=$2; shift 2 ;;
+    --source-only) SOURCE_ONLY=1; shift ;;
     --agent-timeout-sec) AGENT_TIMEOUT_OVERRIDE=$2; shift 2 ;;
     --artifact-root) ARTIFACT_ROOT=$2; shift 2 ;;
     --campaign-id) CAMPAIGN_ID=$2; shift 2 ;;
@@ -75,11 +78,18 @@ TASK_ID=$(basename "$TASK_DIR")
 RUNTIME_DIR=${RUNTIME_DIR_OVERRIDE:-"/tmp/claude-sdk-takeover-${TASK_ID}-${SUDO_UID:-$UID}"}
 
 if ((EUID != 0)); then
+  EXTRA_ARGS=()
+  if [[ -n "$SOURCE_CHECKPOINT_INPUT" ]]; then
+    EXTRA_ARGS+=(--source-checkpoint-input "$SOURCE_CHECKPOINT_INPUT")
+  fi
+  if ((SOURCE_ONLY)); then
+    EXTRA_ARGS+=(--source-only)
+  fi
   exec sudo \
     --preserve-env=ENV_FILE,ARTIFACT_ROOT,CAMPAIGN_ID,RUNTIME_DIR_OVERRIDE,STORAGE_DRIVER,HOST_PYTHON,CODING_PLAN_BASE_URL,CODING_PLAN_API_KEY \
     "$0" --task-dir "$TASK_DIR" --source-model "$SOURCE_MODEL" \
     --target-models "$TARGET_MODELS" --source-strategy "$SOURCE_STRATEGY" \
-    ${SOURCE_CHECKPOINT_INPUT:+--source-checkpoint-input "$SOURCE_CHECKPOINT_INPUT"} \
+    "${EXTRA_ARGS[@]}" \
     --agent-timeout-sec "$AGENT_TIMEOUT_OVERRIDE" \
     --artifact-root "$ARTIFACT_ROOT" --campaign-id "$CAMPAIGN_ID"
 fi
@@ -460,6 +470,7 @@ result = {
     "checkpoint_ms": $CHECKPOINT_MS,
     "source_turn_ms": native.get("turn1_ms"),
     "source_verifier": json.loads('''$SOURCE_VERIFIER_SUMMARY'''),
+    "source_only": bool($SOURCE_ONLY),
     "private_tests_present_in_source": False,
     "criu_images_retained": False,
     "source_checkpoint_input": sys.argv[2] or None,
@@ -469,6 +480,36 @@ result = {
 }
 Path("$SOURCE_DIR/checkpoint.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 PY
+
+if ((SOURCE_ONLY)); then
+  cleanup
+  trap - EXIT
+  MAIN_DOCKER_PID_AFTER=$(systemctl show -p MainPID --value docker 2>/dev/null || echo unknown)
+  MAIN_UNTOUCHED=false
+  [[ "$MAIN_DOCKER_PID_BEFORE" == "$MAIN_DOCKER_PID_AFTER" ]] && MAIN_UNTOUCHED=true
+  SECRET_SCAN_CLEAN=true
+  if grep -R -F -q -- "$CODING_PLAN_API_KEY" "$CAMPAIGN_DIR"; then
+    SECRET_SCAN_CLEAN=false
+  fi
+  "$HOST_PYTHON" - "$SOURCE_DIR/checkpoint.json" \
+    "$MAIN_UNTOUCHED" "$SECRET_SCAN_CLEAN" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["cleanup"] = {
+    "runtime_removed": True,
+    "main_docker_untouched": sys.argv[2] == "true",
+    "secret_scan_clean": sys.argv[3] == "true",
+}
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+  chown -R "$OWNER_UID:$OWNER_GID" "$CAMPAIGN_DIR"
+  echo "SOURCE_ROLLOUT_COMPLETE $CAMPAIGN_DIR"
+  exit 0
+fi
 
 summarize_route() {
   local target=$1 mode=$2 container=$3 before_pid=$4 after_pid=$5 restored=$6
