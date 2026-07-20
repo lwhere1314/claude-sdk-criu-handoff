@@ -13,3 +13,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: make check
+      - name: codex-cli static checks
+        run: |
+          python3 -m py_compile codex-cli/src/controller.py
+          bash -n codex-cli/scripts/run-canary.sh codex-cli/scripts/cleanup-runtime.sh
+      - name: harbor-resume static checks
+        run: |
+          python3 -m py_compile harbor-resume/src/harbor_resume/*.py
+          python3 -c "import sys; sys.path.insert(0,'harbor-resume/src'); import harbor_resume.registry, harbor_resume._docker, harbor_resume.cli"

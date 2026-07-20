@@ -21,6 +21,13 @@ native session files and workspace survive inside the restored container.
 This tests restoration at a **stable model-turn boundary**. It does not claim
 to migrate a live TLS connection or an in-flight model generation.
 
+> A parallel canary built on the **Codex CLI** (`codex exec resume`) instead of
+> the Claude SDK lives in [`codex-cli/`](codex-cli/README.md).
+>
+> [`harbor-resume/`](harbor-resume/README.md) applies the same idea to the
+> **Harbor** (Terminal-Bench) harness: snapshot a run at the boundary and resume
+> it by run id with an optional model override, no fork of Harbor.
+
 ## Requirements
 
 - Linux host with root or passwordless `sudo`
